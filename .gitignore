@@ -1,0 +1,15 @@
+# Generated enumeration results
+*-enum/
+
+# Temporary files
+*.tmp
+*.log
+
+# Editor files
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
