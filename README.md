@@ -112,7 +112,9 @@ example.com-enum/
 
 ## Example
 
-![subenum example output](assets/subenum-example.png)
+<p align="center">
+  <img src="assets/subenum_example.png" width="900">
+</p>
 
 ## Third-Party Services
 
