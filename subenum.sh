@@ -12,6 +12,8 @@
 #   discovery -> per-source normalization/deduplication
 #             -> global deduplication
 #             -> puredns resolution
+#             -> dnsx retry of unresolved names
+#             -> final resolved dataset
 #             -> dnsx A/CNAME enumeration
 
 set -uo pipefail
@@ -56,8 +58,8 @@ Options:
 Example:
   $0 example.com
 
-  $0 example.com \\
-    --resolvers ~/scripts/resolvers.txt \\
+  $0 example.com \
+    --resolvers ~/scripts/resolvers.txt
 EOF
 }
 
@@ -153,7 +155,7 @@ fi
 
 missing=0
 
-for cmd in subfinder puredns dnsx curl sort grep sed tr wc; do
+for cmd in subfinder puredns dnsx curl sort grep sed tr wc comm; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "${red}[-] Missing dependency: $cmd${nc}"
         missing=1
@@ -248,6 +250,28 @@ count_file() {
     fi
 }
 
+spinner() {
+    local pid="$1"
+    local message="$2"
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local i=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r%b[*]%b %s %b%s%b' \
+            "$cyan" \
+            "$nc" \
+            "$message" \
+            "$cyan" \
+            "${frames[i]}" \
+            "$nc"
+
+        i=$(( (i + 1) % ${#frames[@]} ))
+        sleep 0.08
+    done
+
+    printf '\r\033[K'
+}
+
 # ---------------------------------------------------------------------------
 # Passive discovery
 # ---------------------------------------------------------------------------
@@ -256,8 +280,10 @@ echo
 print_banner
 echo "${cyan}[*] Enumerating ${domain}${nc}"
 echo
-echo "[*] Running passive discovery..."
-echo
+
+passive_output="$tmpdir/passive-output.txt"
+
+(
 
 # ---------------------------------------------------------------------------
 # Subfinder
@@ -412,6 +438,24 @@ else
     fi
 fi
 
+) > "$passive_output" 2>&1 &
+
+passive_pid=$!
+
+spinner \
+    "$passive_pid" \
+    "Running passive discovery..."
+
+wait "$passive_pid"
+passive_status=$?
+
+echo
+cat "$passive_output"
+
+if (( passive_status != 0 )); then
+    echo "${yellow}[!] Passive discovery completed with errors.${nc}"
+fi
+
 # ---------------------------------------------------------------------------
 # Global deduplication
 # ---------------------------------------------------------------------------
@@ -443,22 +487,35 @@ fi
 # ---------------------------------------------------------------------------
 # DNS resolution
 #
-# IMPORTANT:
-# This occurs only AFTER:
+# Workflow:
 #
-#   1. Every passive source has completed.
-#   2. Every source has been independently deduplicated.
-#   3. The combined dataset has been globally deduplicated.
+#   1. Resolve the globally deduplicated dataset with PureDNS.
+#   2. Identify names PureDNS did not resolve.
+#   3. Retry those names with dnsx.
+#   4. Merge dnsx-recovered names with the PureDNS results.
+#   5. Deduplicate the final resolved dataset.
+#
+# This provides a secondary validation pass for transient DNS failures,
+# resolver inconsistencies, dropped queries, or other resolution misses.
 #
 # ---------------------------------------------------------------------------
 
 echo
 echo "[*] Resolving ${all_count} unique subdomains..."
 
+puredns_resolved="$tmpdir/puredns-resolved.txt"
+puredns_missed="$tmpdir/puredns-missed.txt"
+dnsx_retry_raw="$tmpdir/dnsx-retry.raw"
+dnsx_recovered="$tmpdir/dnsx-recovered.txt"
+
+# ---------------------------------------------------------------------------
+# Primary resolution: PureDNS
+# ---------------------------------------------------------------------------
+
 if ! puredns resolve \
     "$all_file" \
     --resolvers "$resolvers" \
-    --write "$resolved_file" \
+    --write "$puredns_resolved" \
     --quiet \
     >/dev/null
 then
@@ -466,16 +523,84 @@ then
     exit 1
 fi
 
-# puredns normally produces unique output, but enforce it anyway.
+# PureDNS normally produces unique output, but enforce it anyway.
 sort -u \
-    "$resolved_file" \
-    -o "$resolved_file"
+    "$puredns_resolved" \
+    -o "$puredns_resolved"
 
-resolved_count="$(count_file "$resolved_file")"
+puredns_count="$(count_file "$puredns_resolved")"
 
 printf "${green}[+]${nc} %-26s %s\n" \
-    "Resolved" \
+    "Resolved by PureDNS" \
+    "$puredns_count"
+
+# ---------------------------------------------------------------------------
+# Identify PureDNS misses
+# ---------------------------------------------------------------------------
+
+comm -23 \
+    "$all_file" \
+    "$puredns_resolved" \
+    > "$puredns_missed"
+
+missed_count="$(count_file "$puredns_missed")"
+
+# ---------------------------------------------------------------------------
+# Secondary resolution: dnsx
+# ---------------------------------------------------------------------------
+
+: > "$dnsx_recovered"
+
+if (( missed_count > 0 )); then
+
+    printf "${yellow}[*]${nc} %-26s %s\n" \
+        "Retrying with dnsx" \
+        "$missed_count"
+
+    if dnsx \
+        -l "$puredns_missed" \
+        -r "$resolvers" \
+        -auto-wildcard \
+        -silent \
+        > "$dnsx_retry_raw"
+    then
+        normalize_file \
+            "$dnsx_retry_raw" \
+            "$dnsx_recovered"
+    else
+        echo "${yellow}[!] dnsx retry failed; continuing with PureDNS results.${nc}"
+        : > "$dnsx_recovered"
+    fi
+fi
+
+recovered_count="$(count_file "$dnsx_recovered")"
+
+printf "${green}[+]${nc} %-26s %s\n" \
+    "Recovered by dnsx" \
+    "$recovered_count"
+
+# ---------------------------------------------------------------------------
+# Merge final resolved dataset
+# ---------------------------------------------------------------------------
+
+cat \
+    "$puredns_resolved" \
+    "$dnsx_recovered" \
+    | sort -u \
+    > "$resolved_file"
+
+resolved_count="$(count_file "$resolved_file")"
+unresolved_count=$((all_count - resolved_count))
+
+printf "${green}[+]${nc} %-26s %s\n" \
+    "Final resolved" \
     "$resolved_count"
+
+if (( unresolved_count > 0 )); then
+    printf "${yellow}[-]${nc} %-26s %s\n" \
+        "Unresolved" \
+        "$unresolved_count"
+fi
 
 # ---------------------------------------------------------------------------
 # DNS records

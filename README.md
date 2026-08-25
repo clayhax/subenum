@@ -1,6 +1,6 @@
 # subenum
 
-`subenum` is a Bash-based subdomain enumeration utility that combines multiple passive discovery sources, normalizes and deduplicates the results, resolves discovered subdomains, and collects A and CNAME DNS records.
+`subenum` is a Bash-based subdomain enumeration utility that combines multiple passive discovery sources, normalizes and deduplicates the results, performs wildcard-aware DNS resolution and validation, and collects A and CNAME DNS records.
 
 ## Features
 
@@ -11,7 +11,8 @@
   - Submap
 - Per-source normalization and deduplication
 - Global deduplication before DNS resolution
-- DNS resolution with PureDNS
+- Primary DNS resolution with PureDNS
+- Wildcard-aware retry of unresolved names with dnsx
 - A and CNAME record collection with dnsx
 - Per-source result files
 - Custom resolver support
@@ -25,6 +26,17 @@ The following tools must be installed and available in `$PATH`:
 - `dnsx`
 - `curl`
 - `jq`
+- `sort`
+- `grep`
+- `sed`
+- `tr`
+- `wc`
+- `comm`
+
+`dnsx` must support the `-auto-wildcard` option. 
+```text
+dnsx -h | grep -i -A4 -B4 wildcard
+```
 
 A resolver file is also required. The default path is:
 
@@ -74,18 +86,30 @@ Submap ────────┘
                          │
                          ▼
                       PureDNS
+                     /       \
+                    /         \
+             resolved       unresolved
+                 │               │
+                 │               ▼
+                 │        dnsx wildcard-aware
+                 │              retry
+                 │               │
+                 └───────┬───────┘
                          │
                          ▼
-                     resolved.txt
+                   resolved.txt
                          │
                          ▼
                        dnsx
+                  A/CNAME records
                          │
                          ▼
                   dns-records.txt
 ```
 
 DNS resolution occurs only after all passive discovery sources have completed and the combined results have been deduplicated.
+
+PureDNS performs the primary resolution pass. Names that are not resolved during the initial pass are retried with dnsx using automatic wildcard filtering. Successfully recovered names are merged with the PureDNS results and deduplicated before A and CNAME records are collected.
 
 ## Output
 
@@ -105,8 +129,8 @@ example.com-enum/
 
 ### Result files
 
-- `all-subdomains.txt` — all unique subdomains discovered across every source.
-- `resolved.txt` — discovered subdomains that successfully resolve.
+- `all-subdomains.txt` — all unique passive discoveries, including names that may not currently resolve.
+- `resolved.txt` — discovered subdomains confirmed through the PureDNS primary pass or wildcard-aware dnsx retry.
 - `dns-records.txt` — A and CNAME information collected by dnsx.
 - `sources/` — normalized and deduplicated results from each individual discovery source.
 
